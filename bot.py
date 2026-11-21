@@ -19,7 +19,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {123456789}  # Замените на ваш Telegram ID (можно несколько через запятую)
+ADMIN_IDS = {1437371388}  # Замените на ваш Telegram ID (можно несколько через запятую)
 TIMEZONE_OFFSET = 3      # Часовой пояс в часах от UTC (например, 3 для Москвы)
 DB_PATH = "queue_bot.db"
 # =============================================
