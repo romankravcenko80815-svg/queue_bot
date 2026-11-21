@@ -893,4 +893,13 @@ async def cb_adm_del_confirm(callback: CallbackQuery) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     init_db()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBot
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Бот запущен! Для остановки нажмите Ctrl+C.")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
