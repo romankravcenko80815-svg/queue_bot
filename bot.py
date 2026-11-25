@@ -1,7 +1,7 @@
 import asyncio
-import os
 import html
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -9,7 +9,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,9 +19,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {1437371388}  # Замените на ваш Telegram ID (можно несколько через запятую)
-TIMEZONE_OFFSET = 3      # Часовой пояс в часах от UTC (например, 3 для Москвы)
+ADMIN_IDS = {123456789}  # ЗАМЕНИТЕ на ваш Telegram ID (число без кавычек)
+TIMEZONE_OFFSET = 3      # Часовой пояс от UTC (3 — Москва / СПб)
 DB_PATH = "queue_bot.db"
+CHECK_INTERVAL_SEC = 30  # Как часто проверять открытие очередей (в секундах)
 # =============================================
 
 TZ = timezone(timedelta(hours=TIMEZONE_OFFSET))
@@ -54,7 +55,8 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 event_time TEXT NOT NULL,
-                open_time TEXT NOT NULL
+                open_time TEXT NOT NULL,
+                notified_open INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS entries (
@@ -65,7 +67,41 @@ def init_db() -> None:
                 position INTEGER NOT NULL,
                 FOREIGN KEY (queue_id) REFERENCES queues(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
+        )
+
+        # Безопасное обновление старой базы (если колонки ещё нет)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(queues)").fetchall()]
+        if "notified_open" not in cols:
+            conn.execute("ALTER TABLE queues ADD COLUMN notified_open INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "UPDATE queues SET notified_open = 1 WHERE open_time <= ?",
+                (now_local().strftime("%Y-%m-%d %H:%M"),),
+            )
+
+
+def are_notifications_enabled() -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'notifications_enabled'"
+        ).fetchone()
+        return True if row is None else row["value"] == "1"
+
+
+def set_notifications_enabled(enabled: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value)
+            VALUES ('notifications_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("1" if enabled else "0",),
         )
 
 
@@ -73,6 +109,12 @@ def get_user_name(user_id: int) -> Optional[str]:
     with get_conn() as conn:
         row = conn.execute("SELECT full_name FROM users WHERE user_id = ?", (user_id,)).fetchone()
         return row["full_name"] if row else None
+
+
+def get_all_user_ids() -> list[int]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+        return [row["user_id"] for row in rows]
 
 
 def save_user(user_id: int, full_name: str, username: Optional[str]) -> None:
@@ -93,14 +135,48 @@ def save_user(user_id: int, full_name: str, username: Optional[str]) -> None:
         )
 
 
-def create_queue(title: str, event_dt: datetime) -> int:
+def get_queue_close_dt(queue: dict) -> datetime:
+    return datetime.strptime(queue["event_time"], "%Y-%m-%d %H:%M") + timedelta(days=1)
+
+
+def get_queue_status(queue: dict) -> str:
+    """Возвращает: 'waiting' (до открытия), 'open' (активна), 'closed' (прошло 24ч после события)."""
+    now = now_local()
+    open_dt = datetime.strptime(queue["open_time"], "%Y-%m-%d %H:%M")
+    close_dt = get_queue_close_dt(queue)
+    if now < open_dt:
+        return "waiting"
+    if now < close_dt:
+        return "open"
+    return "closed"
+
+
+def is_queue_open(queue: dict) -> bool:
+    return get_queue_status(queue) == "open"
+
+
+def create_queue(title: str, event_dt: datetime) -> tuple[int, str]:
     open_dt = event_dt - timedelta(days=2)
+    close_dt = event_dt + timedelta(days=1)
+    now = now_local()
+    if now < open_dt:
+        status = "waiting"
+    elif now < close_dt:
+        status = "open"
+    else:
+        status = "closed"
+
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO queues (title, event_time, open_time) VALUES (?, ?, ?)",
-            (title, event_dt.strftime("%Y-%m-%d %H:%M"), open_dt.strftime("%Y-%m-%d %H:%M")),
+            "INSERT INTO queues (title, event_time, open_time, notified_open) VALUES (?, ?, ?, ?)",
+            (
+                title,
+                event_dt.strftime("%Y-%m-%d %H:%M"),
+                open_dt.strftime("%Y-%m-%d %H:%M"),
+                0 if status == "waiting" else 1,
+            ),
         )
-        return cur.lastrowid
+        return cur.lastrowid, status
 
 
 def get_queue(queue_id: int) -> Optional[dict]:
@@ -115,6 +191,21 @@ def get_all_queues() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_queues_to_notify_open() -> list[dict]:
+    now_str = now_local().strftime("%Y-%m-%d %H:%M")
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM queues WHERE notified_open = 0 AND open_time <= ?",
+            (now_str,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_queue_notified(queue_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE queues SET notified_open = 1 WHERE id = ?", (queue_id,))
+
+
 def update_queue_title(queue_id: int, new_title: str) -> None:
     with get_conn() as conn:
         conn.execute("UPDATE queues SET title = ? WHERE id = ?", (new_title, queue_id))
@@ -122,10 +213,16 @@ def update_queue_title(queue_id: int, new_title: str) -> None:
 
 def update_queue_time(queue_id: int, event_dt: datetime) -> None:
     open_dt = event_dt - timedelta(days=2)
+    already_passed_open = now_local() >= open_dt
     with get_conn() as conn:
         conn.execute(
-            "UPDATE queues SET event_time = ?, open_time = ? WHERE id = ?",
-            (event_dt.strftime("%Y-%m-%d %H:%M"), open_dt.strftime("%Y-%m-%d %H:%M"), queue_id),
+            "UPDATE queues SET event_time = ?, open_time = ?, notified_open = ? WHERE id = ?",
+            (
+                event_dt.strftime("%Y-%m-%d %H:%M"),
+                open_dt.strftime("%Y-%m-%d %H:%M"),
+                1 if already_passed_open else 0,
+                queue_id,
+            ),
         )
 
 
@@ -251,13 +348,12 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def is_queue_open(queue: dict) -> bool:
-    open_dt = datetime.strptime(queue["open_time"], "%Y-%m-%d %H:%M")
-    return now_local() >= open_dt
-
-
 def fmt_dt(dt_str: str) -> str:
     return datetime.strptime(dt_str, "%Y-%m-%d %H:%M").strftime("%d.%m.%Y в %H:%M")
+
+
+def fmt_dt_obj(dt_obj: datetime) -> str:
+    return dt_obj.strftime("%d.%m.%Y в %H:%M")
 
 
 async def safe_edit(message: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -268,6 +364,61 @@ async def safe_edit(message: Message, text: str, reply_markup: Optional[InlineKe
             raise
 
 
+async def broadcast_to_users(
+    bot: Bot,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> int:
+    user_ids = get_all_user_ids()
+    sent_count = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text, reply_markup=reply_markup)
+            sent_count += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
+        except Exception as e:
+            logging.warning(f"Не удалось отправить уведомление пользователю {uid}: {e}")
+        await asyncio.sleep(0.05)
+    return sent_count
+
+
+async def check_opening_queues(bot: Bot) -> None:
+    """Фоновая задача: рассылает уведомления, когда до события остаётся 48 часов."""
+    while True:
+        try:
+            queues_to_notify = get_queues_to_notify_open()
+            for q in queues_to_notify:
+                mark_queue_notified(q["id"])
+
+                # Если очередь уже успела закрыться или уведомления отключены — не рассылаем
+                if get_queue_status(q) != "open":
+                    continue
+                if not are_notifications_enabled():
+                    logging.info(f"Очередь #{q['id']} открылась, но уведомления отключены админом.")
+                    continue
+
+                text = (
+                    f"🟢 <b>Открылась запись в очередь!</b>\n\n"
+                    f"📌 <b>{html.escape(q['title'])}</b>\n"
+                    f"📅 Событие: {fmt_dt(q['event_time'])}\n\n"
+                    f"Нажмите кнопку ниже, чтобы занять место:"
+                )
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Открыть очередь", callback_data=f"view:{q['id']}")]
+                    ]
+                )
+                sent = await broadcast_to_users(bot, text, reply_markup=kb)
+                logging.info(f"Очередь #{q['id']} открылась. Уведомлено пользователей: {sent}")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logging.exception("Ошибка в фоновой проверке открытия очередей")
+
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
+
+
 def format_queue_text(
     queue: dict,
     entries: list[dict],
@@ -275,13 +426,20 @@ def format_queue_text(
     bot_username: Optional[str] = None,
 ) -> str:
     title = html.escape(queue["title"])
-    open_flag = is_queue_open(queue)
-    status = "🟢 Запись открыта" if open_flag else f"🔒 Откроется: {fmt_dt(queue['open_time'])}"
+    status = get_queue_status(queue)
+    close_dt = get_queue_close_dt(queue)
+
+    if status == "open":
+        status_text = f"🟢 Запись открыта (закроется {fmt_dt_obj(close_dt)})"
+    elif status == "waiting":
+        status_text = f"⏳ Откроется: {fmt_dt(queue['open_time'])}"
+    else:
+        status_text = f"🔴 Закрыта (завершилась {fmt_dt_obj(close_dt)})"
 
     lines = [
         f"<b>📌 {title}</b>",
         f"📅 Событие: {fmt_dt(queue['event_time'])}",
-        f"Статус: {status}",
+        f"Статус: {status_text}",
         "",
     ]
 
@@ -290,11 +448,16 @@ def format_queue_text(
         lines.append(f"🔗 Ссылка для участников:\n<code>{link}</code>\n")
 
     if entries:
-        lines.append("<b>Текущая очередь:</b>")
+        lines.append("<b>Список очереди:</b>")
         for idx, item in enumerate(entries, start=1):
             lines.append(f"{idx}. {html.escape(item['display_name'])}")
     else:
-        lines.append("<i>Очередь пока пуста.</i>")
+        if status == "open":
+            lines.append("<i>Очередь пока пуста.</i>")
+        elif status == "waiting":
+            lines.append("<i>Запись ещё не открыта. Доступ появится автоматически за двое суток до события.</i>")
+        else:
+            lines.append("<i>Очередь закрыта. Участников не было.</i>")
 
     return "\n".join(lines)
 
@@ -302,7 +465,8 @@ def format_queue_text(
 # ================= КЛАВИАТУРЫ =================
 def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Активные очереди", callback_data="list_queues")
+    kb.button(text="🟢 Активные очереди", callback_data="list_queues")
+    kb.button(text="🔒 Закрытые очереди", callback_data="list_closed_queues")
     kb.button(text="✏️ Изменить имя", callback_data="change_name")
     if is_admin(user_id):
         kb.button(text="⚙️ Админ-панель", callback_data="admin_menu")
@@ -319,26 +483,45 @@ def cancel_kb(back_cb: str = "cancel_fsm") -> InlineKeyboardMarkup:
 def queue_view_kb(queue: dict, entries: list[dict], user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     qid = queue["id"]
+    status = get_queue_status(queue)
     in_queue = any(e["user_id"] == user_id for e in entries)
 
-    if is_queue_open(queue):
+    if status == "open":
         if in_queue:
             kb.button(text="❌ Выйти из очереди", callback_data=f"leave:{qid}")
         else:
             kb.button(text="✅ Встать в очередь", callback_data=f"join:{qid}")
+        kb.button(text="🔄 Обновить список", callback_data=f"view:{qid}")
+        kb.button(text="⬅️ К активным очередям", callback_data="list_queues")
+    elif status == "waiting":
+        kb.button(text="🔄 Проверить открытие", callback_data=f"view:{qid}")
+        kb.button(text="⬅️ К закрытым очередям", callback_data="list_closed_queues")
+    else:
+        kb.button(text="🔄 Обновить список", callback_data=f"view:{qid}")
+        kb.button(text="⬅️ К закрытым очередям", callback_data="list_closed_queues")
 
-    kb.button(text="🔄 Обновить список", callback_data=f"view:{qid}")
-    kb.button(text="⬅️ К списку очередей", callback_data="list_queues")
+    kb.button(text="🏠 В главное меню", callback_data="main_menu")
     if is_admin(user_id):
         kb.button(text="⚙️ Редактировать (админ)", callback_data=f"adm_q:{qid}")
     kb.adjust(1)
     return kb.as_markup()
 
 
+def admin_menu_text() -> str:
+    notify_status = "🔔 ВКЛ (рассылка работает)" if are_notifications_enabled() else "🔕 ВЫКЛ (режим тишины)"
+    return (
+        f"<b>⚙️ Админ-панель</b>\n"
+        f"Уведомления пользователям: <b>{notify_status}</b>\n\n"
+        f"Выберите действие:"
+    )
+
+
 def admin_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    notify_btn = "🔕 Отключить уведомления" if are_notifications_enabled() else "🔔 Включить уведомления"
     kb.button(text="➕ Создать очередь", callback_data="adm_create")
     kb.button(text="📂 Управление очередями", callback_data="adm_queues")
+    kb.button(text=notify_btn, callback_data="adm_toggle_notify")
     kb.button(text="⬅️ В главное меню", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -362,19 +545,6 @@ async def show_queue_to_user(target: Message, qid: int, user_id: int, edit: bool
     if not queue:
         text = "Эта очередь не найдена или была удалена."
         kb = main_menu_kb(user_id)
-    elif not is_queue_open(queue) and not is_admin(user_id):
-        text = (
-            f"<b>⏳ {html.escape(queue['title'])}</b>\n\n"
-            f"📅 Дата события: {fmt_dt(queue['event_time'])}\n"
-            f"🔒 Доступ к записи открывается за двое суток до начала:\n"
-            f"<b>{fmt_dt(queue['open_time'])}</b>"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"view:{qid}")],
-                [InlineKeyboardButton(text="📋 Активные очереди", callback_data="list_queues")],
-            ]
-        )
     else:
         entries = get_entries(qid)
         text = format_queue_text(queue, entries)
@@ -470,7 +640,7 @@ async def cb_change_name(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "list_queues")
 async def cb_list_queues(callback: CallbackQuery) -> None:
     all_queues = get_all_queues()
-    open_queues = [q for q in all_queues if is_queue_open(q)]
+    open_queues = [q for q in all_queues if get_queue_status(q) == "open"]
 
     kb = InlineKeyboardBuilder()
     for q in open_queues:
@@ -478,17 +648,53 @@ async def cb_list_queues(callback: CallbackQuery) -> None:
             text=f"🟢 {q['title']} ({fmt_dt(q['event_time'])})",
             callback_data=f"view:{q['id']}",
         )
+    kb.button(text="🔒 Закрытые очереди", callback_data="list_closed_queues")
     kb.button(text="⬅️ В главное меню", callback_data="main_menu")
     kb.adjust(1)
 
     if open_queues:
-        text = "<b>📋 Активные очереди</b>\nВыберите очередь, чтобы посмотреть список или записаться:"
+        text = "<b>🟢 Активные очереди</b>\nВыберите очередь, чтобы посмотреть список или записаться:"
     else:
         text = (
-            "<b>📋 Активные очереди</b>\n\n"
+            "<b>🟢 Активные очереди</b>\n\n"
             "Сейчас нет открытых очередей.\n"
-            "<i>Доступ к новым очередям открывается за двое суток до события.</i>"
+            "<i>Предстоящие и завершённые очереди можно посмотреть в разделе «🔒 Закрытые очереди».</i>"
         )
+
+    await safe_edit(callback.message, text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "list_closed_queues")
+async def cb_list_closed_queues(callback: CallbackQuery) -> None:
+    all_queues = get_all_queues()
+    waiting_queues = [q for q in all_queues if get_queue_status(q) == "waiting"]
+    finished_queues = [q for q in all_queues if get_queue_status(q) == "closed"]
+
+    kb = InlineKeyboardBuilder()
+    for q in waiting_queues:
+        kb.button(
+            text=f"⏳ {q['title']} (откр. {fmt_dt(q['open_time'])})",
+            callback_data=f"view:{q['id']}",
+        )
+    for q in reversed(finished_queues):
+        kb.button(
+            text=f"🔴 {q['title']} (завершена)",
+            callback_data=f"view:{q['id']}",
+        )
+    kb.button(text="🟢 Активные очереди", callback_data="list_queues")
+    kb.button(text="⬅️ В главное меню", callback_data="main_menu")
+    kb.adjust(1)
+
+    if waiting_queues or finished_queues:
+        text = (
+            "<b>🔒 Закрытые очереди</b>\n"
+            "⏳ — ожидают открытия (за 48 ч до события)\n"
+            "🔴 — завершены (прошло 24 ч после события)\n\n"
+            "Нажмите на очередь, чтобы посмотреть подробности и список:"
+        )
+    else:
+        text = "<b>🔒 Закрытые очереди</b>\n\nСейчас нет закрытых очередей."
 
     await safe_edit(callback.message, text, reply_markup=kb.as_markup())
     await callback.answer()
@@ -509,11 +715,13 @@ async def cb_join_queue(callback: CallbackQuery) -> None:
         await callback.answer("Очередь не найдена.", show_alert=True)
         return
 
-    if not is_queue_open(queue):
-        await callback.answer(
-            f"Запись откроется {fmt_dt(queue['open_time'])}.",
-            show_alert=True,
-        )
+    status = get_queue_status(queue)
+    if status == "waiting":
+        await callback.answer(f"Запись откроется {fmt_dt(queue['open_time'])}.", show_alert=True)
+        return
+    if status == "closed":
+        await show_queue_to_user(callback.message, qid, callback.from_user.id, edit=True)
+        await callback.answer("Событие прошло, эта очередь уже закрыта.", show_alert=True)
         return
 
     name = get_user_name(callback.from_user.id)
@@ -529,6 +737,16 @@ async def cb_join_queue(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("leave:"))
 async def cb_leave_queue(callback: CallbackQuery) -> None:
     qid = int(callback.data.split(":")[1])
+    queue = get_queue(qid)
+    if not queue:
+        await callback.answer("Очередь не найдена.", show_alert=True)
+        return
+
+    if get_queue_status(queue) != "open":
+        await show_queue_to_user(callback.message, qid, callback.from_user.id, edit=True)
+        await callback.answer("Очередь закрыта, изменения недоступны.", show_alert=True)
+        return
+
     removed = leave_queue(qid, callback.from_user.id)
     await show_queue_to_user(callback.message, qid, callback.from_user.id, edit=True)
     await callback.answer("Вы вышли из очереди." if removed else "Вас не было в этой очереди.")
@@ -557,7 +775,7 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    await message.answer("<b>⚙️ Админ-панель</b>\nВыберите действие:", reply_markup=admin_menu_kb())
+    await message.answer(admin_menu_text(), reply_markup=admin_menu_kb())
 
 
 @router.callback_query(F.data == "admin_menu")
@@ -566,12 +784,21 @@ async def cb_admin_menu(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет доступа.", show_alert=True)
         return
     await state.clear()
-    await safe_edit(
-        callback.message,
-        "<b>⚙️ Админ-панель</b>\nВыберите действие:",
-        reply_markup=admin_menu_kb(),
-    )
+    await safe_edit(callback.message, admin_menu_text(), reply_markup=admin_menu_kb())
     await callback.answer()
+
+
+@router.callback_query(F.data == "adm_toggle_notify")
+async def cb_adm_toggle_notify(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    new_state = not are_notifications_enabled()
+    set_notifications_enabled(new_state)
+    await safe_edit(callback.message, admin_menu_text(), reply_markup=admin_menu_kb())
+    await callback.answer(
+        "🔔 Уведомления включены!" if new_state else "🔕 Уведомления отключены (режим тишины)."
+    )
 
 
 @router.callback_query(F.data == "adm_queues")
@@ -581,9 +808,10 @@ async def cb_adm_queues(callback: CallbackQuery) -> None:
         return
 
     queues = get_all_queues()
+    icons = {"open": "🟢", "waiting": "⏳", "closed": "🔴"}
     kb = InlineKeyboardBuilder()
     for q in queues:
-        icon = "🟢" if is_queue_open(q) else "🔒"
+        icon = icons[get_queue_status(q)]
         kb.button(
             text=f"{icon} {q['title']} ({fmt_dt(q['event_time'])})",
             callback_data=f"adm_q:{q['id']}",
@@ -592,7 +820,7 @@ async def cb_adm_queues(callback: CallbackQuery) -> None:
     kb.button(text="⬅️ В админ-панель", callback_data="admin_menu")
     kb.adjust(1)
 
-    text = "<b>📂 Все очереди</b>\n🟢 — открыта для записи | 🔒 — ждёт открытия (за 48 ч):"
+    text = "<b>📂 Все очереди</b>\n🟢 — открыта | ⏳ — ждёт открытия | 🔴 — завершена:"
     await safe_edit(callback.message, text, reply_markup=kb.as_markup())
     await callback.answer()
 
@@ -636,7 +864,7 @@ async def process_create_title(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"Теперь введите <b>дату и время события</b> в формате <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
         f"Например: <code>{example_dt}</code>\n\n"
-        f"<i>Доступ для пользователей откроется автоматически за 48 часов до указанного времени.</i>",
+        f"<i>Очередь откроется за 48 часов до события и автоматически закроется через 24 часа после него.</i>",
         reply_markup=cancel_kb("admin_menu"),
     )
 
@@ -654,9 +882,46 @@ async def process_create_date(message: Message, state: FSMContext, bot: Bot) -> 
         return
 
     data = await state.get_data()
-    qid = create_queue(data["title"], event_dt)
+    title = data["title"]
+    qid, status = create_queue(title, event_dt)
+    queue = get_queue(qid)
     await state.clear()
-    await message.answer("✅ Очередь создана!")
+
+    if not are_notifications_enabled():
+        await message.answer(
+            "✅ Очередь создана!\n"
+            "<i>🔕 Уведомления сейчас отключены — рассылка пользователям не выполнялась.</i>"
+        )
+    elif status == "closed":
+        await message.answer(
+            "✅ Очередь создана (сразу закрыта, так как с момента события прошло больше суток).\n"
+            "<i>Рассылка пользователям не выполнялась.</i>"
+        )
+    else:
+        if status == "open":
+            notify_text = (
+                f"🆕 <b>Создана новая очередь (запись уже открыта!)</b>\n\n"
+                f"📌 <b>{html.escape(title)}</b>\n"
+                f"📅 Событие: {fmt_dt(queue['event_time'])}\n\n"
+                f"Нажмите кнопку ниже, чтобы встать в очередь:"
+            )
+            btn_text = "✅ Открыть очередь"
+        else:
+            notify_text = (
+                f"🆕 <b>Создана новая очередь!</b>\n\n"
+                f"📌 <b>{html.escape(title)}</b>\n"
+                f"📅 Событие: {fmt_dt(queue['event_time'])}\n"
+                f"⏳ Запись откроется: <b>{fmt_dt(queue['open_time'])}</b>\n\n"
+                f"<i>Когда запись откроется, бот пришлёт отдельное уведомление.</i>"
+            )
+            btn_text = "👀 Посмотреть очередь"
+
+        notify_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"view:{qid}")]]
+        )
+        sent = await broadcast_to_users(bot, notify_text, reply_markup=notify_kb)
+        await message.answer(f"✅ Очередь создана! Уведомление отправлено пользователям: <b>{sent}</b>.")
+
     await show_admin_queue(message, bot, qid, edit=False)
 
 
@@ -704,7 +969,7 @@ async def cb_adm_edit_date(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_edit(
         callback.message,
         "Введите <b>новую дату и время события</b> в формате <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
-        "<i>Время открытия записи пересчитается автоматически (минус 48 часов).</i>",
+        "<i>Время открытия (-48ч) и закрытия (+24ч) пересчитаются автоматически.</i>",
         reply_markup=cancel_kb(f"adm_q:{qid}"),
     )
     await callback.answer()
@@ -723,7 +988,7 @@ async def process_edit_date(message: Message, state: FSMContext, bot: Bot) -> No
     qid = data["edit_qid"]
     update_queue_time(qid, event_dt)
     await state.clear()
-    await message.answer("✅ Дата события и время открытия обновлены.")
+    await message.answer("✅ Дата события, время открытия и закрытия обновлены.")
     await show_admin_queue(message, bot, qid, edit=False)
 
 
@@ -798,7 +1063,6 @@ async def show_single_member(message: Message, entry_id: int) -> None:
         await safe_edit(message, "Участник уже удалён.", reply_markup=admin_menu_kb())
         return
     qid = entry["queue_id"]
-    queue = get_queue(qid)
     entries = get_entries(qid)
 
     lines = [f"<b>Редактирование: {html.escape(entry['display_name'])}</b>\n"]
@@ -892,13 +1156,26 @@ async def cb_adm_del_confirm(callback: CallbackQuery) -> None:
 # ================= ЗАПУСК =================
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    if not BOT_TOKEN:
+        raise RuntimeError("Не найдена переменная окружения BOT_TOKEN!")
+
     init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
+
+    notifier_task = asyncio.create_task(check_opening_queues(bot))
     print("Бот запущен! Для остановки нажмите Ctrl+C.")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        notifier_task.cancel()
+        try:
+            await notifier_task
+        except asyncio.CancelledError:
+            pass
+        await bot.session.close()
 
 
 if __name__ == "__main__":
